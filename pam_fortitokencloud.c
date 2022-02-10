@@ -4,8 +4,9 @@
  * description: PAM module to provide 2FA via FortiToken Cloud
 *******************************************************************************/
 
-//#define FTC_PROMPT_MSG "FortiToken OTP (Or Enter if Push Approved): "
+#define FTC_PROMPT_MSG_PUSH "FortiToken OTP (Or Enter if Push Approved): "
 #define FTC_PROMPT_MSG "FortiToken OTP: "
+
 #define FTC_API_LOGIN_URL "https://ftc.fortinet.com:9696/api/v1/login"
 #define FTC_API_AUTH_URL "https://ftc.fortinet.com:9696/api/v1/auth"
 #define FTC_API_USER_URL "https://ftc.fortinet.com:9696/api/v1/user"
@@ -139,7 +140,7 @@ char* ftm_get_access_token(pam_handle_t *pamh, char *ftc_apptoken, char *ftc_app
 			}
 
 			// Allocate memory for the new access token
-			ftc_accesstoken = malloc(access_key_len);
+			ftc_accesstoken = (char*)malloc(access_key_len + 1);
 			if( ftc_accesstoken == NULL )
 			{
 				pam_syslog(pamh, LOG_ERR, "Unable to allocate %d bytes memory for access_token", access_key_len);
@@ -173,7 +174,8 @@ char* ftm_get_access_token(pam_handle_t *pamh, char *ftc_apptoken, char *ftc_app
 }
 
 /*
- * Validate a user-entered code with the FTC Cloud Service
+ * Create a user in the FMC Cloud Service, if they do not exist
+ * If the user does not exist in the realm, they will be sent an invitation
  * Returns a PAM response code based on the server response
  */
 int ftm_create_user(pam_handle_t *pamh, char *ftc_accesstoken, char *username)
@@ -254,10 +256,15 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 		return PAM_AUTHINFO_UNAVAIL;
 	}
 
+	int numerical_token = 0;
+	if( token != NULL && strlen(token) > 0 )
+	{
+		numerical_token = atoi(token);
+	}
+
 	// Setup CURL
 	struct curl_slist* headers = NULL;
 	struct MemoryStruct chunk;
-	short push_request = 0;
 	long http_code = 0;
 	CURLcode res;
 	CURL *curl;
@@ -272,10 +279,10 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 
 		// Create post data
 		char postdata[512];
-		if( token != NULL && strlen(token) >= 1 )
+		if( numerical_token > 0 )
 		{
 			// Token supplied, validate the token
-			if( (strlen(username) + strlen(token)) > 400 || sprintf(postdata, R"anydelim( {"username": "%s", "token": "%s"} )anydelim", username, token) < 0 )
+			if( (strlen(username) + strlen(token)) > 400 || sprintf(postdata, R"anydelim( {"username": "%s", "token": "%d"} )anydelim", username, numerical_token) < 0 )
 			{
 				pam_syslog(pamh, LOG_ERR, "Unable to construct POST payload");
 				return PAM_AUTHINFO_UNAVAIL;
@@ -284,7 +291,6 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 		else
 		{
 			// No token supplied, perform a push request and return the id
-			push_request = 1;
 			if( strlen(username) > 400 || sprintf(postdata, R"anydelim( {"username": "%s"} )anydelim", username) < 0 )
 			{
 				pam_syslog(pamh, LOG_ERR, "Unable to construct POST payload");
@@ -317,9 +323,8 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 		if( http_code >= 200 && http_code <= 299 && res == CURLE_OK )
 		{
-			pam_syslog(pamh, LOG_ERR, "CURL Response: %s", chunk.memory);
 			// Check if we need to extract a token from the response body
-			if( push_request == 1 )
+			if( numerical_token == 0 )
 			{
 				// Find the start of the authid
 				char *substr;
@@ -340,7 +345,7 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 					{
 						// Allocate memory for the new authid
 						char *authid;
-						authid = (char*)malloc(authid_len);
+						authid = (char*)malloc(authid_len + 1);
 						if( authid != NULL )
 						{
 							// Copy substring into memory
@@ -422,8 +427,6 @@ int ftm_validate_push(pam_handle_t *pamh, char *ftc_accesstoken, char *authtoken
 			return PAM_AUTHINFO_UNAVAIL;
 		}
 
-		pam_syslog(pamh, LOG_DEBUG, "CURL Response: %s", getrequest);
-
 		// Create auth header
 		char access_header[512];
 		if( strlen(ftc_accesstoken) > 480 || sprintf(access_header, "Authorization: Bearer %s", ftc_accesstoken) < 0 )
@@ -446,7 +449,7 @@ int ftm_validate_push(pam_handle_t *pamh, char *ftc_accesstoken, char *authtoken
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 		if( http_code >= 200 && http_code <= 299 && res == CURLE_OK )
 		{
-			pam_syslog(pamh, LOG_ERR, "CURL Response: %s", chunk.memory);
+			pam_syslog(pamh, LOG_DEBUG, "CURL Response: %s", chunk.memory);
 			if( strstr(chunk.memory, "authenticated") != NULL )
 			{
 				// User accepted the push request
@@ -495,7 +498,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 	char ftc_apptoken[256];
 	char user_suffix[256];
 	int max_attempts = 3;
-	char username[512];
+	int enable_push = 1;
+	char *username;
 	int i;
 
 	// Retrieve app settings
@@ -513,6 +517,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 		else if( strncmp(argv[i], "user_suffix=", 12) == 0 )
 		{
 			strncpy(user_suffix, argv[i]+12, 256);
+		}
+		else if( strncmp(argv[i], "enable_push=no", 14) == 0 )
+		{
+			enable_push = 0;
 		}
 		else if( strncmp(argv[i], "max_attempts=", 13) )
 		{
@@ -542,14 +550,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 		return retval;
 	}
 
-	if( strlen(usertemp) + strlen(user_suffix) > 512 )
+	int user_length = strlen(usertemp) + strlen(user_suffix);
+	username = (char*)malloc(user_length + 1);
+	if( username == NULL )
 	{
-		pam_syslog(pamh, LOG_ERR, "Username + suffix exceeds available space");
+		pam_syslog(pamh, LOG_ERR, "Unable to allocate memory for username buffer");
 		return PAM_CRED_INSUFFICIENT;
 	}
 
 	sprintf(username, "%s%s", usertemp, user_suffix);
-	pam_syslog(pamh, LOG_DEBUG, "Appended config suffix to username %s", username);
+	pam_syslog(pamh, LOG_DEBUG, "Got username: %s", username);
 
 	// cURL Init
 	curl_global_init(CURL_GLOBAL_ALL);
@@ -561,17 +571,14 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 	{
 		pam_syslog(pamh, LOG_ERR, "Unable to fetch bearer token from FTC cloud service");
 		curl_global_cleanup();
+		free(username);
 
 		return PAM_CRED_INSUFFICIENT;
 	}
 
 	// Validate the user exists, and send a push notification (if enabled in FTC for the user)
 	char *authtoken = NULL;
-
-	// For now, this feature is broken. Mainly on FortiGates side.
-	// For whatever reason, the push notification is sent but never acknowledged by the IOS app, so this just needlessly spams the user
-	/*
-	if( (retval = ftm_validate_token(pamh, ftc_bearertoken, username, NULL, &authtoken)) == PAM_USER_UNKNOWN )
+	if( enable_push == 1 && (retval = ftm_validate_token(pamh, ftc_bearertoken, username, NULL, &authtoken)) == PAM_USER_UNKNOWN )
 	{
 		// Attempt user creation
 		pam_syslog(pamh, LOG_INFO, "Attempting to auto-create user in FTC Cloud Service", username);
@@ -583,6 +590,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 				pam_syslog(pamh, LOG_INFO, "Denying %s as they do not exist in FTC and PAM_DISALLOW_NULL_AUTHTOK set", username);
 				curl_global_cleanup();
 				free(ftc_bearertoken);
+				free(username);
 
 				return PAM_AUTH_ERR;
 			}
@@ -591,15 +599,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 				pam_syslog(pamh, LOG_INFO, "Allowing %s as they do not exist in FTC and PAM_DISALLOW_NULL_AUTHTOK not set", username);
 				curl_global_cleanup();
 				free(ftc_bearertoken);
+				free(username);
 
 				return PAM_SUCCESS;
 			}
 		}
 	}
-	else if( retval != PAM_SUCCESS )
+	else if( enable_push == 1 && retval != PAM_SUCCESS )
 	{
 		pam_syslog(pamh, LOG_ERR, "Failed to request Push Notification for user %s", username);
-	}*/
+	}
 
 	// Setup Challenge-Response Authentication
 	struct pam_message msg[1], *pmsg[1];
@@ -608,7 +617,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 	char *text;
 
 	msg[0].msg_style = PAM_PROMPT_ECHO_OFF;
-	msg[0].msg = FTC_PROMPT_MSG;
+	if( enable_push == 1 ) msg[0].msg = FTC_PROMPT_MSG_PUSH;
+	else msg[0].msg = FTC_PROMPT_MSG;
 	pmsg[0] = &msg[0];
 	resp = NULL;
 
@@ -619,6 +629,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 		if( authtoken != NULL ) free(authtoken);
 		curl_global_cleanup();
 		free(ftc_bearertoken);
+		free(username);
 		return retval;
 	}
 
@@ -631,6 +642,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 			if( authtoken != NULL ) free(authtoken);
 			curl_global_cleanup();
 			free(ftc_bearertoken);
+			free(username);
 			return retval;
 		}
 
@@ -651,6 +663,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 						if( authtoken != NULL ) free(authtoken);
 						curl_global_cleanup();
 						free(ftc_bearertoken);
+						free(username);
 						free(text);
 
 						return PAM_SUCCESS;
@@ -667,6 +680,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 								pam_syslog(pamh, LOG_INFO, "Denying %s as they do not exist in FTC and PAM_DISALLOW_NULL_AUTHTOK set", username);
 								curl_global_cleanup();
 								free(ftc_bearertoken);
+								free(username);
 
 								return PAM_AUTH_ERR;
 							}
@@ -675,6 +689,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 								pam_syslog(pamh, LOG_INFO, "Allowing %s as they do not exist in FTC and PAM_DISALLOW_NULL_AUTHTOK not set", username);
 								curl_global_cleanup();
 								free(ftc_bearertoken);
+								free(username);
 
 								return PAM_SUCCESS;
 							}
@@ -683,6 +698,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 
 					// Validation failed
 					pam_syslog(pamh, LOG_INFO, "Authentication failed %d (attempt %d of %d)", retval, i+1, max_attempts);
+					free(username);
 					free(text);
 					continue;
 				}
@@ -694,12 +710,13 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 
 			// No input text from user, validate push notification
 			pam_syslog(pamh, LOG_DEBUG, "User did not respond, validating FTM Push");
-			if( (retval = ftm_validate_push(pamh, ftc_bearertoken, authtoken)) == PAM_SUCCESS || retval == PAM_USER_UNKNOWN )
+			if( (retval = ftm_validate_push(pamh, ftc_bearertoken, authtoken)) == PAM_SUCCESS )
 			{
 				pam_syslog(pamh, LOG_INFO, "FTC PUSH authentication succeeded for username %s", username);
 				if( authtoken != NULL ) free(authtoken);
 				curl_global_cleanup();
 				free(ftc_bearertoken);
+				free(username);
 				return retval;
 			}
 
@@ -714,6 +731,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 			if( text != NULL ) free(text);
 			curl_global_cleanup();
 			free(ftc_bearertoken);
+			free(username);
+
 			return PAM_CONV_ERR;
 		}
 	}
@@ -722,5 +741,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,int argc, const
 	pam_syslog(pamh, LOG_INFO, "Authentication attempts exceeded %d retries for username %s", max_attempts, username);
 	curl_global_cleanup();
 	free(ftc_bearertoken);
+	free(username);
+
 	return PAM_MAXTRIES;
 }
