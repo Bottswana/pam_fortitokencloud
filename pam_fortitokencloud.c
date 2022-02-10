@@ -152,6 +152,8 @@ char* ftm_get_access_token(pam_handle_t *pamh, char *ftc_apptoken, char *ftc_app
 
 			// Copy substring into memory
 			strncpy(ftc_accesstoken, startstring, access_key_len);
+			ftc_accesstoken[access_key_len] = '\0';
+
 			pam_syslog(pamh, LOG_DEBUG, "Token retrieved successfully %s", ftc_accesstoken);
 			curl_slist_free_all(headers);
 			curl_easy_cleanup(curl);
@@ -296,8 +298,6 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 				pam_syslog(pamh, LOG_ERR, "Unable to construct POST payload");
 				return PAM_AUTHINFO_UNAVAIL;
 			}
-
-			pam_syslog(pamh, LOG_ERR, "Payload: %s", postdata);
 		}
 
 		// Create auth header
@@ -350,6 +350,8 @@ int ftm_validate_token(pam_handle_t *pamh, char *ftc_accesstoken, char *username
 						{
 							// Copy substring into memory
 							strncpy(authid, startstring, authid_len);
+							authid[authid_len] ='\0';
+
 							pam_syslog(pamh, LOG_DEBUG, "FTC Push AuthID retrieved successfully %s", authid);
 							authtoken[0] = authid;
 						}
